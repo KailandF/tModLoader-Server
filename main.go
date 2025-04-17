@@ -27,7 +27,7 @@ func main() {
 	}
 }
 
-// indexHandler serves the HTML dashboard page
+// indexHandler serves the HTML dashboard web page
 func indexHandler(w http.ResponseWriter, _ *http.Request) {
 	tmpl, err := template.ParseFiles("templates/index.html")
 	if err != nil {
