@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>tMod Server Control</title>
+    <link rel="stylesheet" href="static/style.css"> <!-- Link to the CSS file -->
+</head>
+<body>
+<h1>tMod Server</h1>
+<div>Status: <span id="status" class="status">Loading...</span></div>
+<div style="margin: 20px 0;">
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+</div>
+<h3>Online Players</h3>
+<ul id="players"></ul>
+<h3>Logs</h3>
+<pre id="logbox">Connecting to server...</pre>
+
+<script src="static/script.js"></script> <!-- Link to the JS file -->
+</body>
+</html>

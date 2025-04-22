@@ -1,145 +1,311 @@
 package main
 
 import (
-	"html/template"
-	"io"
+	"bufio"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
+	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// Global variables to track the running server process and its stdin
-var serverCmd *exec.Cmd
-var serverIn io.WriteCloser
+// Configuration constants
+const (
+	screenName     = "tmod_session"                             // Name of the screen session for the Terraria server
+	expectScript   = "$HOME/Desktop/scripts/tmod_server.expect" // Path to the expect script that starts the server
+	hardcopyOutput = "/tmp/tmod_screen_out.txt"                 // Path to save screen output
+)
 
+// Global variables
+var (
+	logs      []string                         // Stores server logs
+	logMutex  sync.Mutex                       // Mutex to protect concurrent access to logs
+	upgrader  = websocket.Upgrader{}           // WebSocket upgrader for HTTP to WebSocket protocol
+	clients   = make(map[*websocket.Conn]bool) // Map of active WebSocket connections
+	clientsMu sync.Mutex                       // Mutex to protect concurrent access to clients map
+)
+
+// WSMessage defines the structure for WebSocket messages
+type WSMessage struct {
+	Status  string   `json:"status"`         // Server status (running/stopped)
+	Players []string `json:"players"`        // List of currently connected players
+	Logs    []string `json:"logs,omitempty"` // Recent server logs
+}
+
+// main initializes the server and sets up HTTP routes
 func main() {
-	// Set up HTTP handlers for the web interface
-	http.HandleFunc("/", indexHandler)
-	http.HandleFunc("/start", startHandler)
-	http.HandleFunc("/stop", stopHandler)
+	// Start a goroutine to periodically check server status
+	go monitorServerStatus()
 
-	// Start the web server on port 8080
-	log.Println("Web dashboard running at :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal("ListenAndServe:", err)
-	}
+	// Set up HTTP routes without authentication middleware
+	http.HandleFunc("/", indexHandler)      // Serve index page
+	http.HandleFunc("/ws", wsHandler)       // WebSocket endpoint
+	http.HandleFunc("/start", startHandler) // Start server endpoint
+	http.HandleFunc("/stop", stopHandler)   // Stop server endpoint
+	// Serve static files from web directory
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("./web/static"))))
+
+	log.Println("Server started at http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// indexHandler serves the HTML dashboard web page
-func indexHandler(w http.ResponseWriter, _ *http.Request) {
-	tmpl, err := template.ParseFiles("templates/index.html")
-	if err != nil {
-		http.Error(w, "Failed to load page", http.StatusInternalServerError)
-		log.Println("Template error:", err)
-		return
-	}
-	err = tmpl.Execute(w, nil)
-	if err != nil {
-		http.Error(w, "Failed to render page", http.StatusInternalServerError)
-		log.Println("Template execution error:", err)
-	}
+// indexHandler serves the main HTML page
+func indexHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println("Received request for index page") // Log when this handler is called
+	http.ServeFile(w, r, "./web/index.html")
 }
 
-// startHandler launches the tModLoader server and sends required inputs
+// startHandler handles requests to start the Terraria server
 func startHandler(w http.ResponseWriter, r *http.Request) {
-	// Only allow POST requests
+	// Ensure endpoint only accepts POST requests
 	if r.Method != http.MethodPost {
-		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Prevent multiple servers from starting
-	if serverCmd != nil {
+	// Check if server is already running
+	if isServerRunning() {
 		http.Error(w, "Server already running", http.StatusConflict)
 		return
 	}
 
-	// Command to start the server script
-	cmd := exec.Command("/home/pi/tModLoader/start-tModLoaderServer.sh")
-
-	// Get stdin pipe to send automated input
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		http.Error(w, "Failed to get stdin", http.StatusInternalServerError)
-		log.Println("stdin error:", err)
-		return
-	}
-
-	// Connect server output to this process's stdout/stderr for logging
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// Start the server process
-	if err := cmd.Start(); err != nil {
+	// Start the Terraria server in a new screen session
+	cmd := exec.Command("screen", "-S", screenName, "-dm", "bash", "-c", expectScript)
+	if err := cmd.Run(); err != nil {
 		http.Error(w, "Failed to start server", http.StatusInternalServerError)
-		log.Println("Start error:", err)
+		addLog("Failed to start server: " + err.Error())
 		return
 	}
 
-	// Save command and stdin for later use
-	serverCmd = cmd
-	serverIn = stdin
-
-	// Send the required sequence of inputs to the server
-	go func() {
-		time.Sleep(2 * time.Second) // Give time for server to be ready for input
-
-		// Inputs expected by the tModLoader server script
-		inputs := []string{"y\n", "f\n", "3\n", "1\n", "\n", "n\n", "\n"}
-		for _, input := range inputs {
-			_, err := io.WriteString(stdin, input)
-			if err != nil {
-				log.Println("Error writing to stdin:", err)
-				return
-			}
-			time.Sleep(500 * time.Millisecond) // Small delay between inputs
-		}
-
-		// Close stdin once all inputs are sent
-		if err := stdin.Close(); err != nil {
-			log.Println("Error closing stdin:", err)
-		}
-	}()
-
-	log.Println("tModLoader server start initiated.")
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	// Log successful start and broadcast status to clients
+	addLog("Server started at " + time.Now().Format(time.RFC1123))
+	broadcastStatus()
 }
 
-// stopHandler sends the "exit" command to stop the server cleanly
+// stopHandler handles requests to stop the Terraria server
 func stopHandler(w http.ResponseWriter, r *http.Request) {
-	// Only allow POST requests
+	// Ensure endpoint only accepts POST requests
 	if r.Method != http.MethodPost {
-		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Ensure the server is running before trying to stop it
-	if serverCmd == nil || serverIn == nil {
-		http.Error(w, "Server not running", http.StatusBadRequest)
+	// Check if server is running
+	if !isServerRunning() {
+		http.Error(w, "Server not running", http.StatusConflict)
 		return
 	}
 
-	// Send "exit" to the server to stop it gracefully
-	_, err := io.WriteString(serverIn, "exit\n")
+	// Send exit command to the server
+	sendScreenCommand("exit")
+
+	// Log successful stop and broadcast status to clients
+	addLog("Server stopped at " + time.Now().Format(time.RFC1123))
+	broadcastStatus()
+}
+
+// isServerRunning checks if the server screen session exists
+func isServerRunning() bool {
+	cmd := exec.Command("screen", "-list")
+	out, err := cmd.Output()
 	if err != nil {
-		http.Error(w, "Failed to send stop command", http.StatusInternalServerError)
-		log.Println("Error writing 'exit' to stdin:", err)
+		return false
+	}
+	// Check if the screen session name is found in the output
+	return strings.Contains(string(out), screenName)
+}
+
+// sendScreenCommand sends a command to the screen session
+func sendScreenCommand(command string) {
+	err := exec.Command("screen", "-S", screenName, "-X", "stuff", command+"\n").Run()
+	if err != nil {
+		fmt.Println("Could not send screen command")
+		return
+	}
+}
+
+// broadcastStatus sends current server status to all connected WebSocket clients
+func broadcastStatus() {
+	// Lock to prevent concurrent map access
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+
+	// Prepare message with default "stopped" status
+	msg := WSMessage{
+		Status:  "stopped",
+		Players: []string{},
+		Logs:    getLastLogs(),
+	}
+
+	// Update message if server is running
+	if isServerRunning() {
+		msg.Status = "running"
+		msg.Players = getCurrentPlayers()
+	}
+
+	// Marshal message to JSON
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Println("Error marshaling WebSocket message:", err)
 		return
 	}
 
-	// Wait for the server process to finish in a goroutine
-	go func() {
-		err := serverCmd.Wait()
-		if err != nil {
-			log.Println("Server process wait error:", err)
+	// Send message to all clients
+	for client := range clients {
+		if client == nil {
+			continue
 		}
-		// Reset state
-		serverCmd = nil
-		serverIn = nil
-		log.Println("Server stopped.")
+		if err := client.WriteMessage(websocket.TextMessage, data); err != nil {
+			log.Printf("Error sending message to client: %v", err)
+
+			// Remove and close the faulty client connection
+			delete(clients, client)
+			if cerr := client.Close(); cerr != nil {
+				log.Printf("Error closing WebSocket client: %v", cerr)
+			}
+		}
+	}
+}
+
+// getLastLogs returns the most recent log entries (up to 10)
+func getLastLogs() []string {
+	logMutex.Lock()
+	defer logMutex.Unlock()
+
+	// Return all logs if fewer than 10
+	if len(logs) <= 10 {
+		return logs
+	}
+	// Otherwise return the last 10 logs
+	return logs[len(logs)-10:]
+}
+
+// addLog adds a new log entry with timestamp
+func addLog(entry string) {
+	logMutex.Lock()
+	defer logMutex.Unlock()
+
+	// Format log entry with timestamp
+	logs = append(logs, fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), entry))
+}
+
+// wsHandler handles WebSocket connections
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	// Upgrade HTTP connection to WebSocket
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("WS upgrade failed:", err)
+		return
+	}
+
+	// Ensure connection is closed when handler exits
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing WebSocket connection: %v", err)
+		}
 	}()
 
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	// Add client to active clients map
+	clientsMu.Lock()
+	clients[conn] = true
+	clientsMu.Unlock()
+
+	// Keep connection open and handle incoming messages
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			break // Exit loop on read error (client disconnect)
+		}
+	}
+
+	// Remove client from map when disconnected
+	clientsMu.Lock()
+	delete(clients, conn)
+	clientsMu.Unlock()
+}
+
+// monitorServerStatus periodically checks server status and updates clients
+func monitorServerStatus() {
+	for {
+		// Save screen output if server is running
+		if isServerRunning() {
+			saveScreenOutput()
+		}
+
+		// Broadcast current status to all clients
+		broadcastStatus()
+
+		// Wait before next check
+		time.Sleep(5 * time.Second)
+	}
+}
+
+// saveScreenOutput saves the current screen content to a file
+func saveScreenOutput() {
+	err := exec.Command("screen", "-S", screenName, "-X", "hardcopy", hardcopyOutput).Run()
+	if err != nil {
+		fmt.Println("Could not save screen")
+	}
+}
+
+// getCurrentPlayers retrieves the list of currently connected players
+func getCurrentPlayers() []string {
+	// Send the 'players' command to the server
+	sendScreenCommand("players")
+
+	// Wait for command to execute
+	time.Sleep(2 * time.Second)
+
+	// Save output to file
+	saveScreenOutput()
+
+	// Open the output file
+	file, err := os.Open(hardcopyOutput)
+	if err != nil {
+		return []string{}
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Printf("Error closing file: %v", err)
+		}
+	}()
+
+	// Read file line by line
+	scanner := bufio.NewScanner(file)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	// Search for player list from bottom up (most recent first)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.HasPrefix(lines[i], "Current players") || strings.HasPrefix(lines[i], "Players:") {
+			return parsePlayersLine(lines[i])
+		}
+	}
+	return []string{}
+}
+
+// parsePlayersLine extracts player names from a line of output
+func parsePlayersLine(line string) []string {
+	if strings.Contains(line, ":") {
+		// Split line at first colon
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) > 1 {
+			raw := strings.TrimSpace(parts[1])
+			// Return empty list if no players
+			if raw == "None" || raw == "" {
+				return []string{}
+			}
+			// Split comma-separated list of players
+			return strings.Split(raw, ", ")
+		}
+	}
+	return []string{}
 }
