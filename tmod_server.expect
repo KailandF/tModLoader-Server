@@ -1,0 +1,25 @@
+#!/usr/bin/expect -f
+
+log_user 1
+
+spawn ~/snap/steam/common/.local/share/Steam/steamapps/common/tModLoader/start-tModLoaderServer.sh
+
+expect "*Use steam server*"
+send "n\r"
+
+expect "*Choose World*"
+send "1\r"
+
+expect "*Max Players*"
+send "3\r"
+
+expect "*Server port*"
+send "\r"
+
+expect "*Automatically forward port*"
+send "n\r"
+
+expect -re "Server password.*:"
+send "\r"
+
+interact
